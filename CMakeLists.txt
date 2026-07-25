@@ -1,0 +1,6 @@
+cmake_minimum_required(VERSION 4.4.0)
+project(NombreDeTuProyecto LANGUAGES C)
+set(CMAKE_C_STANDARD 17)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+add_executable(binaries main.c)
+target_compile_options(binaries PRIVATE -Wall -Wextra)

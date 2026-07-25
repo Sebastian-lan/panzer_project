@@ -1,0 +1,18 @@
+# Build de CMake
+build/
+
+# Archivos objeto y binarios sueltos (por si compilás manual sin CMake alguna vez)
+*.o
+*.out
+
+# Python (cuando llegues a Fase 8, entorno virtual y cachés)
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# Configuración local de VSCode que es específica de tu máquina
+.vscode/
+
+# Archivos de sistema operativo
+.DS_Store
