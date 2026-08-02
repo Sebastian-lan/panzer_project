@@ -270,8 +270,11 @@ int main (){
                 free(resultado.memoryBlockPointer);
                 RedirectUrl parsed = parserRedirectURL(new_url);
                 if (parsed.host == NULL) {
+                    free(new_url);
+                    free(host);
+                    free(path);
                     return -1;
-                }
+                }           
                 free(new_url);
                 free(host);
                 free(path);
