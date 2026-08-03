@@ -1,20 +1,141 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include <arpa/inet.h>
+#include <netdb.h>
+#include <openssl/err.h>
+#include <openssl/ssl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <netdb.h>
-#include <arpa/inet.h>
-#include <stdlib.h>
 
 #define BUFFER_SIZE 4096
 
-typedef struct{
-        char *memoryBlockPointer;
-        size_t reservedMemory;
-        size_t usedMemory;
-    } Acumulator;
+/* Acumulador dinámico de bytes crudos (usado para juntar una respuesta
+ * HTTP completa a medida que llega en pedazos por recv()/SSL_read()). */
+typedef struct {
+    char *memoryBlockPointer;
+    size_t reservedMemory;
+    size_t usedMemory;
+} Acumulator;
+
+/* Resultado de parsear una URL de redirección en sus 3 partes. */
+typedef struct {
+    char *host;
+    char *port;
+    char *path;
+} RedirectUrl;
+
+/* Abstracción de transporte: agrupa el socket y, opcionalmente, la sesión
+ * TLS, junto con punteros a función que deciden si send/recv van cifrados
+ * o en texto plano. El resto del programa llama siempre a conn->send_fn/
+ * conn->recv_fn, sin necesidad de saber cuál de los dos casos es. */
+typedef struct Connection {
+    int sock;
+    SSL *ssl;
+    ssize_t (*send_fn)(struct Connection *conn, const char *data, size_t len);
+    ssize_t (*recv_fn)(struct Connection *conn, char *buffer, size_t max_len);
+} Connection;
+
+ssize_t plain_send(Connection *conn, const char *data, size_t len) {
+    return send(conn->sock, data, len, 0);
+}
+
+ssize_t plain_recv(Connection *conn, char *buffer, size_t max_len) {
+    return recv(conn->sock, buffer, max_len, 0);
+}
+
+ssize_t tls_send(Connection *conn, const char *data, size_t len) {
+    int resultado = SSL_write(conn->ssl, data, len);
+    if (resultado <= 0) {
+        /* Simplificación: tratamos cualquier <= 0 como error, sin
+         * distinguir los casos de "reintentar" que SSL_get_error()
+         * podría señalar. Suficiente para pedidos simples. */
+        return -1;
+    }
+    return resultado;
+}
+
+ssize_t tls_recv(Connection *conn, char *buffer, size_t max_len) {
+    int resultado = SSL_read(conn->ssl, buffer, max_len);
+    if (resultado < 0) {
+        return -1; /* error real */
+    }
+    return resultado; /* 0 = fin normal de los datos, o bytes leídos */
+}
+
+/*
+ * Establece el handshake TLS si usa_tls es 1, o deja la conexión en texto
+ * plano si es 0. En ambos casos, asigna los punteros de función
+ * correspondientes. Devuelve NULL si algo falla en cualquier paso.
+ */
+Connection *create_connect(int sock, int usa_tls, const char *host) {
+    Connection *conn = malloc(sizeof(Connection));
+    if (conn == NULL) {
+        return NULL;
+    }
+    conn->sock = sock;
+
+    if (usa_tls == 0) {
+        conn->send_fn = plain_send;
+        conn->recv_fn = plain_recv;
+        conn->ssl = NULL;
+        return conn;
+    }
+
+    SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
+    if (ctx == NULL) {
+        free(conn);
+        return NULL;
+    }
+
+    conn->ssl = SSL_new(ctx);
+    if (conn->ssl == NULL) {
+        SSL_CTX_free(ctx);
+        free(conn);
+        return NULL;
+    }
+
+    if (SSL_set_fd(conn->ssl, sock) != 1) {
+        SSL_free(conn->ssl);
+        SSL_CTX_free(ctx);
+        free(conn);
+        return NULL;
+    }
+
+    /* SNI: necesario para que el servidor sepa a qué dominio te querés
+     * conectar durante el handshake, antes de que exista un header
+     * Host: (que llega recién después, ya cifrado). Sin esto, muchos
+     * servidores rechazan la conexión con "unrecognized name". */
+    SSL_set_tlsext_host_name(conn->ssl, host);
+
+    if (SSL_connect(conn->ssl) != 1) {
+        SSL_free(conn->ssl);
+        SSL_CTX_free(ctx);
+        free(conn);
+        return NULL;
+    }
+
+    conn->send_fn = tls_send;
+    conn->recv_fn = tls_recv;
+
+    /* ssl mantiene su propia referencia interna a ctx, así que podemos
+     * liberarlo ahora sin esperar a que termine toda la conexión. */
+    SSL_CTX_free(ctx);
+
+    return conn;
+}
+
+void free_memory_conn(Connection *conn) {
+    if (conn == NULL) {
+        return;
+    }
+    SSL_free(conn->ssl); /* seguro incluso si conn->ssl es NULL */
+    close(conn->sock);
+    free(conn);
+}
+
 /*
  * Resuelve el host y devuelve un socket ya conectado.
  * Devuelve el file descriptor del socket si conecta bien,
@@ -24,12 +145,6 @@ typedef struct{
  * porque quien llama a esta función es responsable de liberarlo
  * después con freeaddrinfo(), una vez que ya no lo necesite.
  */
-typedef struct{
-    char *host;
-    char *port;
-    char *path;
-} RedirectUrl;
-
 int connect_to_host(const char *host, const char *port, struct addrinfo **res_out) {
     struct addrinfo hints;
     struct addrinfo *p;
@@ -65,20 +180,14 @@ int connect_to_host(const char *host, const char *port, struct addrinfo **res_ou
 }
 
 /*
- * Arma y manda una petición GET simple sobre el socket ya conectado.
+ * Arma y manda una petición GET simple sobre la conexión ya establecida.
  * Devuelve 0 si se mandó todo bien, -1 si hubo error.
  */
-int send_get_request(int sock, const char *host, const char *path) {
+int send_get_request(Connection *conn, const char *host, const char *path) {
     char request[BUFFER_SIZE];
     int written;
     ssize_t sent;
 
-    /*
-     * snprintf arma el string igual que printf, pero en vez de
-     * imprimirlo en pantalla lo escribe en el buffer que le pasás.
-     * El segundo argumento (sizeof(request)) evita que se pueda
-     * desbordar el buffer aunque host/path sean muy largos.
-     */
     written = snprintf(request, sizeof(request),
                         "GET %s HTTP/1.1\r\n"
                         "Host: %s\r\n"
@@ -91,7 +200,7 @@ int send_get_request(int sock, const char *host, const char *path) {
         return -1;
     }
 
-    sent = send(sock, request, strlen(request), 0);
+    sent = conn->send_fn(conn, request, strlen(request));
     if (sent == -1) {
         perror("Error en send");
         return -1;
@@ -101,88 +210,92 @@ int send_get_request(int sock, const char *host, const char *path) {
 }
 
 /*
- * Lee la respuesta del socket en un loop, imprimiendo cada
- * pedazo a medida que llega.
+ * Lee la respuesta completa en un loop, acumulando los pedazos que van
+ * llegando en un bloque de memoria dinámica que crece según haga falta.
  */
-Acumulator receive_response(int sock) {
+Acumulator receive_response(Connection *conn) {
     Acumulator error_result = {NULL, 0, 0};
     Acumulator acumulator_var;
+    ssize_t bytes_recibidos;
+
     acumulator_var.memoryBlockPointer = malloc(4096);
-    
-    if(acumulator_var.memoryBlockPointer == NULL){
-        printf("ERROR DE MALLOC\n");
+    if (acumulator_var.memoryBlockPointer == NULL) {
+        fprintf(stderr, "Error de malloc en receive_response\n");
         return error_result;
     }
     acumulator_var.reservedMemory = 4096;
     acumulator_var.usedMemory = 0;
-    ssize_t bytes_recibidos;
 
     do {
-        if((acumulator_var.usedMemory + 4096) > acumulator_var.reservedMemory){
+        if ((acumulator_var.usedMemory + 4096) > acumulator_var.reservedMemory) {
             acumulator_var.reservedMemory *= 2;
             char *temp = realloc(acumulator_var.memoryBlockPointer, acumulator_var.reservedMemory);
             if (temp == NULL) {
-                printf("ERROR DE REALLOC");
+                fprintf(stderr, "Error de realloc en receive_response\n");
                 free(acumulator_var.memoryBlockPointer);
                 return error_result;
-            }else{
-                acumulator_var.memoryBlockPointer = temp;
             }
+            acumulator_var.memoryBlockPointer = temp;
         }
-        bytes_recibidos = recv(sock, acumulator_var.memoryBlockPointer + acumulator_var.usedMemory, acumulator_var.reservedMemory - acumulator_var.usedMemory, 0);
-        if(bytes_recibidos > 0){
-        acumulator_var.usedMemory += bytes_recibidos;
+
+        bytes_recibidos = conn->recv_fn(conn, acumulator_var.memoryBlockPointer + acumulator_var.usedMemory,
+                                         acumulator_var.reservedMemory - acumulator_var.usedMemory);
+        if (bytes_recibidos > 0) {
+            acumulator_var.usedMemory += bytes_recibidos;
         }
-    }while (bytes_recibidos > 0);
-    if(bytes_recibidos == -1){
-        perror("Error de recv");
+    } while (bytes_recibidos > 0);
+
+    if (bytes_recibidos < 0) {
+        fprintf(stderr, "Error en recv/SSL_read\n");
         free(acumulator_var.memoryBlockPointer);
         return error_result;
-    }else{
-        acumulator_var.memoryBlockPointer[acumulator_var.usedMemory] = '\0'; 
     }
+
+    acumulator_var.memoryBlockPointer[acumulator_var.usedMemory] = '\0';
     return acumulator_var;
 }
 
-RedirectUrl parserRedirectURL(char *URLToParsear){
+/*
+ * Separa una URL completa (esquema://host/path) en sus 3 partes.
+ * Devuelve una RedirectUrl con host == NULL si algo falla.
+ */
+RedirectUrl parserRedirectURL(char *URLToParsear) {
+    RedirectUrl redirect_error = {NULL, NULL, NULL};
     RedirectUrl redirect_var;
     int longitudHost;
-    RedirectUrl redirect_error;
-    redirect_error.host = NULL;
-    redirect_error.path = NULL;
-    redirect_error.port = NULL;
 
-    if (strncmp(URLToParsear, "https", 5) == 0) {
-        redirect_var.port = "443";
-    }else {
-        redirect_var.port = "80";
-    }
+    redirect_var.port = (strncmp(URLToParsear, "https", 5) == 0) ? "443" : "80";
 
     char *startHost = strstr(URLToParsear, "://");
     if (startHost == NULL) {
-        printf("ERROR EN REDIRECCION");
+        fprintf(stderr, "Error al parsear el esquema de la URL de redireccion\n");
         return redirect_error;
     }
     startHost = startHost + strlen("://");
+
     char *startPath = strstr(startHost, "/");
     if (startPath == NULL) {
-        redirect_var.path = malloc(2);
-        strcpy(redirect_var.path, "/");
         longitudHost = strlen(startHost);
-    }else{
+        redirect_var.path = malloc(2);
+        if (redirect_var.path == NULL) {
+            fprintf(stderr, "Error de malloc en parserRedirectURL\n");
+            return redirect_error;
+        }
+        strcpy(redirect_var.path, "/");
+    } else {
         longitudHost = startPath - startHost;
         int longitudPath = strlen(startPath);
         redirect_var.path = malloc(longitudPath + 1);
         if (redirect_var.path == NULL) {
-            printf("ERROR DE MALLOC EN PARSER\n");
+            fprintf(stderr, "Error de malloc en parserRedirectURL\n");
             return redirect_error;
-        }else{
-            strcpy(redirect_var.path, startPath);
         }
+        strcpy(redirect_var.path, startPath);
     }
+
     redirect_var.host = malloc(longitudHost + 1);
     if (redirect_var.host == NULL) {
-        printf("ERROR DE MALLOC EN PARSER");
+        fprintf(stderr, "Error de malloc en parserRedirectURL\n");
         free(redirect_var.path);
         return redirect_error;
     }
@@ -192,45 +305,56 @@ RedirectUrl parserRedirectURL(char *URLToParsear){
     return redirect_var;
 }
 
-char *getNewUrl(char *respuesta, int *error_code){
-    char *newURL;
+/*
+ * Busca el header Location: en una respuesta HTTP y devuelve su valor
+ * como string propio (memoria dinámica). Devuelve NULL en error, con
+ * el detalle en *error_code (1 = no se encontro Location, 2 = no se
+ * encontro el fin de linea, 3 = fallo el malloc).
+ */
+char *getNewUrl(char *respuesta, int *error_code) {
     char *startURL = strstr(respuesta, "Location: ");
     if (startURL == NULL) {
         *error_code = 1;
         return NULL;
     }
     startURL = startURL + strlen("Location: ");
+
     char *endURL = strchr(startURL, '\r');
     if (endURL == NULL) {
         *error_code = 2;
-        return  NULL;
+        return NULL;
     }
-    int longitud = endURL - startURL; 
-    newURL = malloc(longitud + 1);
+
+    int longitud = endURL - startURL;
+    char *newURL = malloc(longitud + 1);
     if (newURL == NULL) {
         *error_code = 3;
         return NULL;
     }
     memcpy(newURL, startURL, longitud);
-    newURL[longitud ] = '\0';
+    newURL[longitud] = '\0';
     return newURL;
 }
 
-int get_status_code(char *resultado){
+/* Devuelve la categoria del status code (2, 3, 4, 5...), o -1 si no se
+ * pudo encontrar la linea de estado en la respuesta. */
+int get_status_code(char *resultado) {
     char *startStatusCode = strstr(resultado, "HTTP/1.1 ");
-    if(startStatusCode == NULL){
-        printf("Error al encontrar el status code");
+    if (startStatusCode == NULL) {
+        fprintf(stderr, "Error al encontrar el status code\n");
         return -1;
     }
     startStatusCode = startStatusCode + strlen("HTTP/1.1 ");
-    return (atoi(startStatusCode)/100);
+    return atoi(startStatusCode) / 100;
 }
-int main (){
+
+int main(void) {
     char *host = malloc(256);
     strcpy(host, "archlinux.org");
     char *port = "80";
     char *path = malloc(256);
     strcpy(path, "/");
+
     struct addrinfo *res;
     int redirect_count = 0;
     int sock;
@@ -240,77 +364,92 @@ int main (){
     int error_code = 0;
 
     do {
+        int usa_tls = (strcmp(port, "443") == 0) ? 1 : 0;
+
         sock = connect_to_host(host, port, &res);
         if (sock == -1) {
+            freeaddrinfo(res);
+            free(host);
+            free(path);
+            return -1;
+        }
+
+        Connection *conn = create_connect(sock, usa_tls, host);
+        if (conn == NULL) {
+            freeaddrinfo(res);
+            close(sock);
+            free(host);
+            free(path);
             return -1;
         }
         freeaddrinfo(res);
-        logNumber = send_get_request(sock, host, path);
+
+        logNumber = send_get_request(conn, host, path);
         if (logNumber == -1) {
+            free_memory_conn(conn);
+            free(host);
+            free(path);
             return -1;
         }
-        resultado = receive_response(sock);
+
+        resultado = receive_response(conn);
+        free_memory_conn(conn);
         if (resultado.memoryBlockPointer == NULL) {
+            free(host);
+            free(path);
             return -1;
         }
-        close(sock);
+
         int status_code = get_status_code(resultado.memoryBlockPointer);
         switch (status_code) {
-            case 2:{
-                terminado = 0;
-                printf("exito");
+            case 2: {
+                terminado = 1;
+                printf("Exito\n");
                 break;
             }
-            case 3:{
+            case 3: {
                 char *new_url = getNewUrl(resultado.memoryBlockPointer, &error_code);
                 if (new_url == NULL) {
                     fprintf(stderr, "ERROR tipo %d al obtener la URL de redireccion\n", error_code);
-                    break;
-                }
-                free(resultado.memoryBlockPointer);
-                RedirectUrl parsed = parserRedirectURL(new_url);
-                if (parsed.host == NULL) {
-                    free(new_url);
+                    free(resultado.memoryBlockPointer);
                     free(host);
                     free(path);
                     return -1;
-                }           
+                }
+                free(resultado.memoryBlockPointer);
+
+                RedirectUrl parsed = parserRedirectURL(new_url);
                 free(new_url);
+                if (parsed.host == NULL) {
+                    free(host);
+                    free(path);
+                    return -1;
+                }
+
                 free(host);
                 free(path);
                 host = parsed.host;
                 path = parsed.path;
                 port = parsed.port;
                 redirect_count += 1;
-                terminado = 1;
                 break;
             }
-            case 4:{
-                printf("ERROR codigo 4xx no soportado\n");
-                free(path);
-                free(host);
+            case 4:
+            case 5:
+            default: {
+                fprintf(stderr, "ERROR: status code categoria %d no soportada\n", status_code);
                 free(resultado.memoryBlockPointer);
+                free(host);
+                free(path);
                 return -1;
             }
-            case 5:{
-                printf("ERROR codigo 5xx no soportado\n");
-                free(path);
-                free(host);
-                free(resultado.memoryBlockPointer);
-                return -1;
-            }
-            default: 
-                printf("ERROR codigo no valido\n");
-                free(path);
-                free(host);
-                free(resultado.memoryBlockPointer);
-                return -1;
         }
 
-    }while (terminado != 0 && redirect_count < 20);
+    } while (terminado == 0 && redirect_count < 20);
 
-    printf("------resultado--------");
+    printf("------resultado--------\n");
     printf("%s", resultado.memoryBlockPointer);
+
     free(resultado.memoryBlockPointer);
     free(path);
     free(host);
