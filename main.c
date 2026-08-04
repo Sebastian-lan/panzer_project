@@ -1,5 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include "core/dom/node.h"
+
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <openssl/err.h>
